@@ -1,0 +1,266 @@
+package generator
+
+import (
+	kourierEnvoy "github.com/3scale/kourier/pkg/envoy"
+	"go.uber.org/zap"
+	"k8s.io/api/networking/v1beta1"
+
+	kubeclient "k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"knative.dev/pkg/tracker"
+
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+)
+
+// TODO: replace knative tracker
+
+type IngressTranslator struct {
+	kubeclient      kubeclient.Interface
+	endpointsLister corev1listers.EndpointsLister
+	localDomainName string
+	tracker         tracker.Interface
+	logger          *zap.SugaredLogger
+}
+
+type translatedIngress struct {
+	ingressName          string
+	ingressNamespace     string
+	sniMatches           []*kourierEnvoy.SNIMatch
+	routes               []*route.Route
+	clusters             []*v2.Cluster
+	externalVirtualHosts []*route.VirtualHost
+	internalVirtualHosts []*route.VirtualHost
+}
+
+func NewIngressTranslator(kubeclient kubeclient.Interface, endpointsLister corev1listers.EndpointsLister, localDomainName string, tracker tracker.Interface,
+	logger *zap.SugaredLogger) IngressTranslator {
+	return IngressTranslator{
+		kubeclient:      kubeclient,
+		endpointsLister: endpointsLister,
+		localDomainName: localDomainName,
+		tracker:         tracker,
+		logger:          logger,
+	}
+}
+
+// TODO: adapt the function below to k8s ingress
+func (translator *IngressTranslator) translateIngress(ingress *v1beta1.Ingress, extAuthzEnabled bool) (*translatedIngress, error) {
+	return nil, nil
+}
+
+/*
+func (translator *IngressTranslator) translateIngress(ingress *v1beta1.Ingress, extAuthzEnabled bool) (*translatedIngress, error) {
+	res := &translatedIngress{
+		ingressName:      ingress.Name,
+		ingressNamespace: ingress.Namespace,
+	}
+
+	for _, ingressTLS := range ingress.Spec.TLS {
+		sniMatch, err := sniMatchFromIngressTLS(ingressTLS, translator.kubeclient)
+
+		if err != nil {
+			translator.logger.Errorf("%s", err)
+
+			// We need to propagate this error to the reconciler so the current
+			// event can be retried. This error might be caused because the
+			// secrets referenced in the TLS section of the spec do not exist
+			// yet. That's expected when auto TLS is configured.
+			// See the "TestPerKsvcCert_localCA" test in Knative Serving. It's a
+			// test that fails if this error is not propagated:
+			// https://github.com/knative/serving/blob/571e4db2392839082c559870ea8d4b72ef61e59d/test/e2e/autotls/auto_tls_test.go#L68
+			return nil, err
+		}
+		res.sniMatches = append(res.sniMatches, sniMatch)
+	}
+
+	for _, rule := range ingress.Spec.Rules {
+
+		var ruleRoute []*route.Route
+
+		for _, httpPath := range rule.HTTP.Paths {
+
+			path := "/"
+			if httpPath.Path != "" {
+				path = httpPath.Path
+			}
+
+			var wrs []*route.WeightedCluster_ClusterWeight
+
+			for _, split := range httpPath.Splits {
+				if err := trackService(translator.tracker, split.ServiceName, ingress); err != nil {
+					return nil, err
+				}
+
+				endpoints, err := translator.endpointsLister.Endpoints(split.ServiceNamespace).Get(split.ServiceName)
+				if apierrors.IsNotFound(err) {
+					translator.logger.Warnf("Endpoints '%s/%s' not yet created", split.ServiceNamespace, split.ServiceName)
+					break
+				} else if err != nil {
+					return nil, fmt.Errorf("failed to fetch endpoints '%s/%s': %w", split.ServiceNamespace, split.ServiceName, err)
+				}
+
+				service, err := translator.kubeclient.CoreV1().Services(split.ServiceNamespace).Get(split.ServiceName, metav1.GetOptions{})
+				if apierrors.IsNotFound(err) {
+					translator.logger.Warnf("Service '%s/%s' not yet created", split.ServiceNamespace, split.ServiceName)
+					break
+				} else if err != nil {
+					return nil, fmt.Errorf("failed to fetch service '%s/%s': %w", split.ServiceNamespace, split.ServiceName, err)
+				}
+
+				var targetPort int32
+				http2 := false
+				for _, port := range service.Spec.Ports {
+					if port.Port == split.ServicePort.IntVal || port.Name == split.ServicePort.StrVal {
+						targetPort = port.TargetPort.IntVal
+						http2 = port.Name == "http2" || port.Name == "h2c"
+					}
+				}
+
+				publicLbEndpoints := lbEndpointsForKubeEndpoints(endpoints, targetPort)
+
+				connectTimeout := 5 * time.Second
+				cluster := envoy.NewCluster(split.ServiceName+path, connectTimeout, publicLbEndpoints, http2, v2.Cluster_STATIC)
+
+				res.clusters = append(res.clusters, cluster)
+
+				weightedCluster := envoy.NewWeightedCluster(split.ServiceName+path, uint32(split.Percent), split.AppendHeaders)
+
+				wrs = append(wrs, weightedCluster)
+			}
+
+			if len(wrs) != 0 {
+				r := createRouteForRevision(ingress.Name, ingress.Namespace, httpPath, wrs)
+				ruleRoute = append(ruleRoute, r)
+				res.routes = append(res.routes, r)
+			}
+
+		}
+
+		if len(ruleRoute) == 0 {
+			// Return nothing if there are not routes to generate.
+			return nil, nil
+		}
+
+		externalDomains := knative.ExternalDomains(rule, translator.localDomainName)
+
+		// External should also be accessible internally
+		internalDomains := append(knative.InternalDomains(rule, translator.localDomainName), externalDomains...)
+
+		var virtualHost, internalVirtualHost route.VirtualHost
+		if extAuthzEnabled {
+
+			visibility := ingress.Spec.Visibility
+			if visibility == "" { // Needed because visibility is optional
+				visibility = v1alpha1.IngressVisibilityClusterLocal
+			}
+
+			ContextExtensions := map[string]string{
+				"client":     "kourier",
+				"visibility": string(visibility),
+			}
+
+			ContextExtensions = mergeMapString(ContextExtensions, ingress.GetLabels())
+
+			virtualHost = envoy.NewVirtualHostWithExtAuthz(ingress.Name, ContextExtensions, externalDomains, ruleRoute)
+			internalVirtualHost = envoy.NewVirtualHostWithExtAuthz(ingress.Name, ContextExtensions, internalDomains,
+				ruleRoute)
+		} else {
+			virtualHost = envoy.NewVirtualHost(ingress.GetName(), externalDomains, ruleRoute)
+			internalVirtualHost = envoy.NewVirtualHost(ingress.GetName(), internalDomains, ruleRoute)
+		}
+
+		if knative.RuleIsExternal(rule, ingress.Spec.Visibility) {
+			res.externalVirtualHosts = append(res.externalVirtualHosts, &virtualHost)
+		}
+
+		res.internalVirtualHosts = append(res.internalVirtualHosts, &internalVirtualHost)
+	}
+
+	return res, nil
+}
+
+func trackService(t tracker.Interface, svcName string, ingress *v1alpha1.Ingress) error {
+	if err := t.TrackReference(tracker.Reference{
+		Kind:       "Service",
+		APIVersion: "v1",
+		Namespace:  ingress.Namespace,
+		Name:       svcName,
+	}, ingress); err != nil {
+		return fmt.Errorf("could not track service reference: %w", err)
+	}
+
+	if err := t.TrackReference(tracker.Reference{
+		Kind:       "Endpoints",
+		APIVersion: "v1",
+		Namespace:  ingress.Namespace,
+		Name:       svcName,
+	}, ingress); err != nil {
+		return fmt.Errorf("could not track endpoints reference: %w", err)
+	}
+	return nil
+}
+
+func lbEndpointsForKubeEndpoints(kubeEndpoints *kubev1.Endpoints, targetPort int32) (publicLbEndpoints []*endpoint.LbEndpoint) {
+	for _, subset := range kubeEndpoints.Subsets {
+		for _, address := range subset.Addresses {
+			lbEndpoint := envoy.NewLBEndpoint(address.IP, uint32(targetPort))
+			publicLbEndpoints = append(publicLbEndpoints, lbEndpoint)
+		}
+	}
+
+	return publicLbEndpoints
+}
+
+func createRouteForRevision(ingressName string, ingressNamespace string, httpPath v1alpha1.HTTPIngressPath, wrs []*route.WeightedCluster_ClusterWeight) *route.Route {
+	routeName := ingressName + "_" + ingressNamespace + "_" + httpPath.Path
+
+	path := "/"
+	if httpPath.Path != "" {
+		path = httpPath.Path
+	}
+
+	var routeTimeout time.Duration
+	if httpPath.Timeout != nil {
+		routeTimeout = httpPath.Timeout.Duration
+	}
+
+	attempts := 0
+	var perTryTimeout time.Duration
+	if httpPath.Retries != nil {
+		attempts = httpPath.Retries.Attempts
+
+		if httpPath.Retries.PerTryTimeout != nil {
+			perTryTimeout = httpPath.Retries.PerTryTimeout.Duration
+		}
+	}
+
+	return envoy.NewRoute(
+		routeName, path, wrs, routeTimeout, uint32(attempts), perTryTimeout, httpPath.AppendHeaders,
+	)
+}
+
+func sniMatchFromIngressTLS(ingressTLS v1alpha1.IngressTLS, kubeClient kubeclient.Interface) (*envoy.SNIMatch, error) {
+	certChain, privateKey, err := sslCreds(
+		kubeClient, ingressTLS.SecretNamespace, ingressTLS.SecretName,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sniMatch := envoy.NewSNIMatch(ingressTLS.Hosts, certChain, privateKey)
+	return &sniMatch, nil
+}
+
+func mergeMapString(a, b map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for k, v := range a {
+		merged[k] = v
+	}
+	for k, v := range b {
+		merged[k] = v
+	}
+	return merged
+}
+*/
